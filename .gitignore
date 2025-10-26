@@ -1,0 +1,26 @@
+# 모델, 체크포인트
+pretrained_models/
+*.pt
+*.pth
+*.ckpt
+
+# 이미지 / 결과물
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# 노트북 파일
+*.ipynb
+
+# 로그 / 캐시 / 실행 파일
+logs/
+wandb/
+__pycache__/
+*.log
+*.tmp
+*.bak
+
+# 환경 관련
+.env
+venv/
