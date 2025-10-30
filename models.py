@@ -197,7 +197,12 @@ class DiTBlock(nn.Module):
 
             if getattr(self, 'interpolation_mode', False):
                 interp_len = len(self.interpolated_attn_features)
-                step_idx = (interp_len - 1) - (current['step'] % interp_len)
+                step_idx = (interp_len - 1) - ((current['step'] - 2) % interp_len)
+                # if current['layer'] == 0:  # 첫 레이어만 찍으면 로그 폭주 방지
+                #     print(
+                #         f"[INTERP] t={current['step']:>3d} | step_idx={step_idx:>2d}/{interp_len-1} | "
+                #         f"layer={current['layer']:>2d}"
+                #     )
                 interp_attn = self.interpolated_attn_features[step_idx][current['layer']].to(x.device)
                 x = x + gate_msa.unsqueeze(1) * interp_attn
 
@@ -214,6 +219,9 @@ class DiTBlock(nn.Module):
                     if not hasattr(self, 'collected_attn_features'):
                         self.collected_attn_features = []
                     self.collected_attn_features.append(attn_output.detach())
+
+
+
                 x = x + gate_msa.unsqueeze(1) * attn_output
 
 
@@ -225,7 +233,7 @@ class DiTBlock(nn.Module):
 
             if getattr(self, 'interpolation_mode', False):
                 interp_len = len(self.interpolated_mlp_features)
-                step_idx = (interp_len - 1) - (current['step'] % interp_len)
+                step_idx = (interp_len - 1) - ((current['step'] - 2) % interp_len)
                 interp_mlp = self.interpolated_mlp_features[step_idx][current['layer']].to(x.device)
                 x = x + gate_mlp.unsqueeze(1) * interp_mlp
 

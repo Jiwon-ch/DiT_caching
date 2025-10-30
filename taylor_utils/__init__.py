@@ -50,7 +50,7 @@ def taylor_cache_init(cache_dic: Dict, current: Dict):
 
 def interpolate_features(tensor_list, target_T, prevprev_tensor=None, stage_ratio=0.0):
     """
-    GPU 전용 Linear Interpolation
+    GPU 전용 Linear Interpolation (양 끝점 고정)
     tensor_list: list of [B, C, H, W] tensors on GPU
     target_T: 원하는 길이
     """
@@ -60,16 +60,16 @@ def interpolate_features(tensor_list, target_T, prevprev_tensor=None, stage_rati
     device = tensor_list[0].device
     orig_T = len(tensor_list)
     stacked = torch.stack(tensor_list, dim=0)  # [T, B, C, H, W]
-    orig_shape = stacked.shape[1:]  # [B, C, H, W]
+    orig_shape = stacked.shape[1:]             # [B, C, H, W]
 
     # flatten for interpolation
-    flattened = stacked.reshape(orig_T, -1)  # [T, D]
+    flattened = stacked.reshape(orig_T, -1)    # [T, D]
 
     # original and target positions
     orig_x = torch.linspace(0, 1, orig_T, device=device)
     target_x = torch.linspace(0, 1, target_T, device=device)
 
-    # find indices
+    # find indices for interpolation (exclude exact 0 and 1)
     idx = torch.clamp(torch.searchsorted(orig_x, target_x) - 1, 0, orig_T - 2)
     x0 = orig_x[idx]
     x1 = orig_x[idx + 1]
@@ -82,7 +82,43 @@ def interpolate_features(tensor_list, target_T, prevprev_tensor=None, stage_rati
 
     # reshape back
     interp_tensor = interp.reshape(target_T, *orig_shape)
+
+    # === enforce exact endpoints ===
+    interp_tensor[0]  = stacked[0]
+    interp_tensor[-1] = stacked[-1]
+
     return interp_tensor
+
+
+def get_interval(prev_features, curr_features, prev_interval, 
+                 high_th=0.7, low_th=0.5, 
+                 min_interval=3, max_interval=6):
+    """
+    Adaptive interval scheduling rule.
+    Feature 변화량에 따라 다음 coarse interval 길이를 동적으로 조정함.
+    """
+    if prev_features is None or curr_features is None:
+        return prev_interval  # 첫 segment에서는 그대로 유지
+    
+    # 변화량 계산 (attention + MLP)
+    diff_attn = torch.mean(torch.abs(curr_features["attn"] - prev_features["attn"])).item()
+    diff_mlp  = torch.mean(torch.abs(curr_features["mlp"]  - prev_features["mlp"])).item()
+    diff_mean = (diff_attn + diff_mlp) / 2
+
+    # 2️⃣ Adaptive rule
+    if diff_mean > high_th:
+        new_interval = max(prev_interval - 1, min_interval)
+        status = f" High dynamic ({diff_mean:.4f}) -> {new_interval}"
+    elif diff_mean < low_th:
+        new_interval = min(prev_interval + 1, max_interval)
+        status = f" Stable ({diff_mean:.4f}) -> {new_interval}"
+    else:
+        new_interval = prev_interval
+        status = f"Moderate ({diff_mean:.4f}) = {new_interval}"
+
+    print(f"[get_interval] {status}")
+    return new_interval
+
 
 
 # import torch

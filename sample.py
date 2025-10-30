@@ -18,8 +18,8 @@ from models import DiT_models
 import argparse
 import os
 import numpy as np
-from taylor_utils import interpolate_features
-
+from taylor_utils import interpolate_features, get_interval
+import math
 
 
 def main(args):
@@ -54,12 +54,6 @@ def main(args):
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
     model.eval()  # important!
-
-
-
-    coarse_steps = args.num_sampling_steps // args.interval + 1
-    diffusion_fine = create_diffusion(str(args.num_sampling_steps+1))
-    diffusion_coarse = create_diffusion(str(coarse_steps))
 
     diffusion = create_diffusion(str(args.num_sampling_steps))
 
@@ -98,113 +92,113 @@ def main(args):
     start.record()
 
 
+    coarse_steps = math.ceil(args.num_sampling_steps / args.interval) 
+    total_steps = args.num_sampling_steps
     z_coarse = z.clone()
     z_fine = z.clone()
     prev_z = None
     prev_features = None
     prevprev_features = None 
 
-    num_segments = coarse_steps - 1
+
     interval = args.interval
+    interval_prev = None
+    cut_t = 0
 
-
-    interp_time_total = 0.0
+    correction_time_total = 0.0
     fine_time_total = 0.0
     coarse_time_total = 0.0
+    interp_time_total = 0.0
 
     ## 저장용
     attn_interp_all = []
     mlp_interp_all = []
     attn_features_all = []
     mlp_features_all = []
+    
 
-
+    
     ##################
 
     if args.ddim_sample:
         if args.use_interp:
-            for seg in range(coarse_steps):
+            while cut_t < total_steps:
+                start_t = cut_t
+                end_t = min(cut_t + interval , total_steps - 1)
 
-                torch.cuda.synchronize()
-                coarse_start = torch.cuda.Event(enable_timing=True)
-                coarse_end = torch.cuda.Event(enable_timing=True)
-                coarse_start.record()
-                if seg == 0:
-                    pass
-                else:
-                    print(f"\n===== [Segment {seg}] Coarse {seg}->{seg+1}, Fine {(seg-1)*interval}->{seg*interval} =====")
-
-                # coarse anchor forward ===============
+                print(f"\n[COARSE {start_t}->{end_t}] (interval={interval})")            
                 model.feature_collection_mode = True
                 model.interpolation_mode = False
                 model.interpolation_mode_coarse = False
-                
-                model.collected_attn_features = []
-                model.collected_mlp_features = []
 
+                model.collected_attn_features, model.collected_mlp_features = [], []
                 for block in model.blocks:
                     block.collected_attn_features = model.collected_attn_features
                     block.collected_mlp_features = model.collected_mlp_features
-                
-                z_coarse = diffusion_coarse.ddim_sample_loop(
+
+                skip = interval if (end_t - start_t) >= interval else 1
+
+                torch.cuda.synchronize()
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+
+                z_coarse = diffusion.ddim_sample_loop(
                     model.forward_with_cfg,
                     z_coarse.shape,
-                    noise=z_coarse,  # coarse chain 유지
+                    noise=z_coarse,
                     clip_denoised=False,
                     model_kwargs=model_kwargs,
                     progress=False,
                     device=device,
-                    start_step=seg,
-                    end_step=seg + 1
+                    start_step=start_t,
+                    end_step=end_t, 
+                    skip_step=skip 
                 )
 
-                coarse_end.record()
+                end_event.record()
                 torch.cuda.synchronize()
-                coarse_elapsed = coarse_start.elapsed_time(coarse_end) * 0.001
-                coarse_time_total += coarse_elapsed
+                coarse_time = start_event.elapsed_time(end_event) * 0.001
+                coarse_time_total += coarse_time
 
                 curr_features = {
                     "attn": torch.stack(model.collected_attn_features, dim=0),
                     "mlp":  torch.stack(model.collected_mlp_features, dim=0),
                 }
 
+                if end_t >= total_steps - 1:
+                    prev_interval = interval_prev if interval_prev is not None else interval
+                    print(f"\n[Last FINE {start_t-interval}->{total_steps}")
 
-                ####저장용
-                # attn_features_all.append(curr_features["attn"].detach().cpu())
-                # mlp_features_all.append(curr_features["mlp"].detach().cpu())
+                    torch.cuda.synchronize()
+                    start_event.record()
 
-                curr_z = z_coarse  # 현재 coarse latent
+                    attn_interp_ = interpolate_features(
+                        [prev_features["attn"], curr_features["attn"]],
+                        target_T=  prev_interval + 1,
+                        prevprev_tensor=None if prevprev_features is None else prevprev_features["attn"],
+                        stage_ratio=stage_ratio
+                    )
+                    mlp_interp_ = interpolate_features(
+                        [prev_features["mlp"], curr_features["mlp"]],
+                        target_T= prev_interval + 1,
+                        prevprev_tensor=None if prevprev_features is None else prevprev_features["mlp"],
+                        stage_ratio=stage_ratio
+                    )
 
-                if prev_features is not None:
+                    attn_interp, mlp_interp = attn_interp_[:-1], mlp_interp_[:-1]
 
-                    total_steps = (coarse_steps - 1) * interval
-                    stage_ratio = (seg * interval) / total_steps
-                    stage_ratio = min(max(stage_ratio, 0.0), 1.0)
-                    
-                    # ① Interpolation
-                    attn_interp_ = interpolate_features([prev_features["attn"], curr_features["attn"]],
-                                                    target_T=interval+1,
-                                                    prevprev_tensor=None if prevprev_features is None else prevprev_features["attn"],
-                                                    stage_ratio=stage_ratio)
-                    mlp_interp_ = interpolate_features([prev_features["mlp"], curr_features["mlp"]],
-                                                    target_T=interval+1,
-                                                    prevprev_tensor=None if prevprev_features is None else prevprev_features["mlp"],
-                                                    stage_ratio=stage_ratio)
-                    
-                    attn_interp = attn_interp_[:-1]
-                    mlp_interp = mlp_interp_[:-1]
+                    #attn_interp_all.append(attn_interp_.detach().cpu())
 
-                    attn_interp_coarse = attn_interp_[-1].unsqueeze(0)
-                    mlp_interp_coarse = mlp_interp_[-1].unsqueeze(0)
-
-                    # ② Fine inference (interpolation 기반)
-                    model.feature_collection_mode = False
-                    model.interpolation_mode = True
-                    model.interpolation_mode_coarse = False
                     model.interpolated_attn_features = attn_interp
                     model.interpolated_mlp_features = mlp_interp
 
-                    z_fine = diffusion_fine.ddim_sample_loop(
+
+                    model.feature_collection_mode = False
+                    model.interpolation_mode = True
+                    model.interpolation_mode_coarse = False
+
+                    z_fine = diffusion.ddim_sample_loop(
                         model.forward_with_cfg,
                         z_fine.shape,
                         noise=z_fine,
@@ -212,68 +206,146 @@ def main(args):
                         model_kwargs=model_kwargs,
                         progress=False,
                         device=device,
-                        start_step=(seg-1)*interval,
-                        end_step=seg*interval
+                        start_step=start_t-prev_interval,
+                        end_step=start_t
                     )
 
-                    # ==========================
-                    # ③ Corrector: fine latent를 coarse chain에 반영 / last step anchor computation
-                    # ==========================
                     model.feature_collection_mode = False
                     model.interpolation_mode = False
+                    model.interpolation_mode_coarse = False
 
+                    z_fine = diffusion.ddim_sample_loop(
+                        model.forward_with_cfg,
+                        z_fine.shape,
+                        noise=z_fine,
+                        clip_denoised=False,
+                        model_kwargs=model_kwargs,
+                        progress=False,
+                        device=device,
+                        start_step=start_t,
+                        end_step=total_steps
+                    )
+
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    fine_time = start_event.elapsed_time(end_event) * 0.001
+                    fine_time_total += fine_time
+
+                    break
+
+                # === (2) If this is not the last segment, interpolate + fine ===
+                if end_t < total_steps - 1 and prev_features is not None:
+                    prev_interval = interval_prev if interval_prev is not None else interval
+                    print(f"\n[Segment FINE {start_t-interval}->{start_t-1}")
+
+                    stage_ratio = start_t / (total_steps - interval)
+                    stage_ratio = min(max(stage_ratio, 0.0), 1.0)
+
+                    attn_interp_ = interpolate_features(
+                        [prev_features["attn"], curr_features["attn"]],
+                        target_T=prev_interval + 1,
+                        prevprev_tensor=None if prevprev_features is None else prevprev_features["attn"],
+                        stage_ratio=stage_ratio
+                    )
+                    mlp_interp_ = interpolate_features(
+                        [prev_features["mlp"], curr_features["mlp"]],
+                        target_T=prev_interval + 1,
+                        prevprev_tensor=None if prevprev_features is None else prevprev_features["mlp"],
+                        stage_ratio=stage_ratio
+                    )
+
+                    attn_interp, mlp_interp = attn_interp_[:-1], mlp_interp_[:-1]
+
+
+                    #attn_interp_all.append(attn_interp.detach().cpu())
+
+
+                    attn_interp_coarse = attn_interp_[-1].unsqueeze(0)
+                    mlp_interp_coarse = mlp_interp_[-1].unsqueeze(0)
+
+                    # === (3) Fine inference for this segment ===
+                    model.feature_collection_mode = False
+                    model.interpolation_mode = True
+                    model.interpolation_mode_coarse = False
+
+                    model.interpolated_attn_features = attn_interp
+                    model.interpolated_mlp_features = mlp_interp
+
+                    torch.cuda.synchronize()
+                    start_event.record()
+
+                    z_fine = diffusion.ddim_sample_loop(
+                        model.forward_with_cfg,
+                        z_fine.shape,
+                        noise=z_fine,
+                        clip_denoised=False,
+                        model_kwargs=model_kwargs,
+                        progress=False,
+                        device=device,
+                        start_step=start_t-prev_interval,
+                        end_step=start_t
+                    )
+
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    fine_time = start_event.elapsed_time(end_event) * 0.001
+                    fine_time_total += fine_time
+
+                    ###############################
+                    ###### Correction Step ########
+                    ###############################
+
+                    model.feature_collection_mode = False
+                    model.interpolation_mode = False
+                    model.interpolation_mode_coarse = True
+                    
                     model.collected_attn_features = []
                     model.collected_mlp_features = []
+
                     for block in model.blocks:
                         block.collected_attn_features = model.collected_attn_features
                         block.collected_mlp_features = model.collected_mlp_features
-
-                    # fine output을 coarse segment의 start로 설정
+                    
                     z_coarse = z_fine.clone()
 
-                    model.interpolation_mode_coarse = True
+
                     model.coarse_feature_attn = attn_interp_coarse
                     model.coarse_feature_mlp = mlp_interp_coarse
 
-                    if seg == (coarse_steps - 1):
-                        print("Final computation")
-                        z_fine = diffusion_fine.ddim_sample_loop(
-                            model.forward_with_cfg,
-                            z_fine.shape,
-                            noise=z_fine,
-                            clip_denoised=False,
-                            model_kwargs=model_kwargs,
-                            progress=False,
-                            device=device,
-                            start_step=seg*interval,
-                            end_step=seg*interval+1
-                        )         
-                    else:               
-                        # coarse corrector forward (1->2를 다시 수행)
-                        z_coarse = diffusion_coarse.ddim_sample_loop(
-                            model.forward_with_cfg,
-                            z_coarse.shape,
-                            noise=z_coarse,
-                            clip_denoised=False,
-                            model_kwargs=model_kwargs,
-                            progress=False,
-                            device=device,
-                            start_step=seg,
-                            end_step=seg + 1
-                        )
 
-                    # # Corrected coarse features 저장
-                    # corrected_features = {
-                    #     "attn": torch.stack(model.collected_attn_features, dim=0),
-                    #     "mlp": torch.stack(model.collected_mlp_features, dim=0),
-                    # }
+                    torch.cuda.synchronize()
+                    start_event.record()
+                    
+                    print(f"[CORRECTION {start_t}->{end_t}] (new interval={interval})")
 
-                    #prevprev_features = prev_features
-                    #prev_features = corrected_features
-                    prev_features = curr_features  
+                    z_coarse = diffusion.ddim_sample_loop(
+                        model.forward_with_cfg,
+                        z_coarse.shape,
+                        noise=z_coarse,
+                        clip_denoised=False,
+                        model_kwargs=model_kwargs,
+                        progress=False,
+                        device=device,
+                        start_step=start_t,
+                        end_step=end_t,
+                        skip_step=interval
+                    )
+                    
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    correction_time = start_event.elapsed_time(end_event) * 0.001
+                    correction_time_total += correction_time
 
+
+                    new_interval = get_interval(prev_features, curr_features, interval)      
+
+                    interval_prev = interval
+                    interval = new_interval  
+                    prev_features = curr_features 
                 else:
                     prev_features = curr_features
+                
+                cut_t = end_t
 
         else: 
             samples = diffusion.ddim_sample_loop(
@@ -287,13 +359,11 @@ def main(args):
 
     if args.use_interp:
         samples = z_fine
-        fine_steps_run = len(diffusion_fine.x0_predictions)
-        print(f"[DEBUG] fine steps actually run = {fine_steps_run} (interval={interval})")
-
-    print(f"\n[STATS] Total coarse forward time = {coarse_time_total:.4f} sec")
-    print(f"[STATS] Total fine forward time   = {fine_time_total:.4f} sec")
-    print(f"[STATS] Total interpolation time  = {interp_time_total:.4f} sec")
-    print(f"[STATS] Total sampling time (coarse+fine+interp) = {coarse_time_total + fine_time_total + interp_time_total:.4f} sec")
+        print(f"Total coarse forward time = {coarse_time_total:.3f} sec")
+        print(f"Total fine forward time   = {fine_time_total:.3f} sec")
+        print(f"Total correction time     = {correction_time_total:.3f} sec")
+        print(f"Total sampling time (all) = {coarse_time_total + fine_time_total + correction_time_total:.3f} sec")
+        
     end.record()
     torch.cuda.synchronize()
     print(f"Total Sampling took {start.elapsed_time(end)*0.001} seconds")
@@ -310,8 +380,8 @@ def main(args):
         uncond_noises = []
 
         # ## INTERPOLATION FEATURES
-        # if len(attn_interp_all) > 0:
-        #     torch.save(attn_interp_all, os.path.join(args.sample_dir, "attn_interpolated_features.pt"))
+        if len(attn_interp_all) > 0:
+            torch.save(attn_interp_all, os.path.join(args.sample_dir, "attn_interpolated_features.pt"))
         # if len(mlp_interp_all) > 0:
         #     torch.save(mlp_interp_all, os.path.join(args.sample_dir, "mlp_interpolated_features.pt"))
 
@@ -324,14 +394,14 @@ def main(args):
             
 
         # ### FULL INFERENCE features
-        # for block in model.blocks:
-        #     if hasattr(block, 'attn_features') and len(block.attn_features) > 0:
-        #         attn_features.append(torch.stack(block.attn_features))
+        for block in model.blocks:
+            if hasattr(block, 'attn_features') and len(block.attn_features) > 0:
+                attn_features.append(torch.stack(block.attn_features))
         #     if hasattr(block, 'mlp_features') and len(block.mlp_features) > 0:
         #         mlp_features.append(torch.stack(block.mlp_features))
 
-        # if attn_features:
-        #     torch.save(attn_features, os.path.join(args.sample_dir, "attn_features_full.pt"))
+        if attn_features:
+            torch.save(attn_features, os.path.join(args.sample_dir, "attn_features_full1.pt"))
         # if mlp_features:
         #     torch.save(mlp_features, os.path.join(args.sample_dir, "mlp_features_full.pt"))
         ##########
@@ -353,7 +423,7 @@ def main(args):
         # if uncond_noises:
         #     torch.save(uncond_noises, os.path.join(args.sample_dir, "uncond_noises.pt"))
         if pred_noises:
-            torch.save(pred_noises, os.path.join(args.sample_dir, "interpolation_noise2.pt"))
+            torch.save(pred_noises, os.path.join(args.sample_dir, "noise1.pt"))
 
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     samples = vae.decode(samples / 0.18215).sample

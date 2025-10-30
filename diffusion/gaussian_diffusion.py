@@ -10,6 +10,7 @@ import numpy as np
 import torch as th
 import enum
 import os
+from tqdm.auto import tqdm
 
 from .diffusion_utils import discretized_gaussian_log_likelihood, normal_kl
 
@@ -547,6 +548,7 @@ class GaussianDiffusion:
         cond_fn=None,
         model_kwargs=None,
         eta=0.0,
+        t_next=None,
     ):
         """
         Sample x_{t-1} from the model using DDIM.
@@ -572,21 +574,39 @@ class GaussianDiffusion:
         eps = self._predict_eps_from_xstart(x, t, out["pred_xstart"])
 
         alpha_bar = _extract_into_tensor(self.alphas_cumprod, t, x.shape)
-        alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
-        sigma = (
-            eta
-            * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
-            * th.sqrt(1 - alpha_bar / alpha_bar_prev)
-        )
-        # Equation 12.
+
+        if t_next is not None:
+            if (t_next >= t).any():
+                print(f"[WARN] t_next >= t detected! t={t.min().item()}, t_next={t_next.min().item()}")
+
+
+        if t_next is None:
+            # 기본 DDIM 
+            alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+            sigma = (
+                eta
+                * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+                * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+            )
+            mean_pred = (
+                out["pred_xstart"] * th.sqrt(alpha_bar_prev)
+                + th.sqrt(1 - alpha_bar_prev - sigma**2) * eps
+            )
+            nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        else:
+            # interval
+            alpha_bar_next = _extract_into_tensor(self.alphas_cumprod, t_next, x.shape)
+            sigma = (
+                eta
+                * th.sqrt((1 - alpha_bar_next) / (1 - alpha_bar))
+                * th.sqrt(1 - alpha_bar / alpha_bar_next)
+            )
+            mean_pred = (
+                out["pred_xstart"] * th.sqrt(alpha_bar_next)
+                + th.sqrt(1 - alpha_bar_next - sigma**2) * eps
+            )
+            nonzero_mask = (t_next > 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         noise = th.randn_like(x)
-        mean_pred = (
-            out["pred_xstart"] * th.sqrt(alpha_bar_prev)
-            + th.sqrt(1 - alpha_bar_prev - sigma ** 2) * eps
-        )
-        nonzero_mask = (
-            (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
-        )  # no noise when t == 0
         sample = mean_pred + nonzero_mask * sigma * noise
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
@@ -643,6 +663,7 @@ class GaussianDiffusion:
         ####
         start_step=0,
         end_step=None,
+        skip_step=1,
     ):
         """
         Generate samples from the model using DDIM.
@@ -666,8 +687,11 @@ class GaussianDiffusion:
             ##
             start_step=start_step,
             end_step=end_step,
+            skip_step=skip_step,
         ):
             final = sample
+        if final is None:
+            raise ValueError(f"[ddim_sample_loop] No steps executed! Check start_step={start_step}, end_step={end_step}, skip_step={skip_step}")
         return final["sample"]
 
     def ddim_sample_loop_progressive(
@@ -684,6 +708,7 @@ class GaussianDiffusion:
         eta=0.0,
         start_step=0,
         end_step=None,
+        skip_step=1,
     ):
         """
         Use DDIM to sample from the model and yield intermediate samples from
@@ -701,42 +726,76 @@ class GaussianDiffusion:
         indices = list(range(self.num_timesteps))[::-1]
         if end_step is None:
             end_step = len(indices)
-
-        # 세그먼트 번호를 '포지션'으로 해석해서 슬라이싱
-        indices = indices[start_step:end_step]
-        #print(f"[DEBUG] indices={indices}")
         
+        
+        indices = list(range(self.num_timesteps))[::-1]  # [49, 48, 47, ..., 0]
 
-        if progress:
-            # Lazy import so that we don't depend on tqdm.
-            from tqdm.auto import tqdm
+        start_idx = self.num_timesteps - 1 - start_step  # 49 - 0 = 49
+        end_idx = max(self.num_timesteps - 1 - end_step, -1)   # 49 - 4 = 45
 
-            indices = tqdm(indices)
+        indices = list(range(start_idx, end_idx - 1, -1))  # ex> [49,48,47,46,45]
+
+        # 간격 적용
+        if skip_step > 1:
+            indices = indices[::skip_step]
+
+        print(indices[:-1])
 
         # Initialization for ToCa     
         cache_dic, current = cache_init(model_kwargs=model_kwargs, num_steps=self.num_timesteps)
 
-        for i in indices:
+        if progress:
+            loop_indices = tqdm(indices[:-1])
+        else:
+            loop_indices = indices[:-1]
+
+        for i_idx, i in enumerate(loop_indices):
             # print(f"loop @@@@@@@@@@@@={indices}")
             # print(f"[DEBUG] {i=}, img={img.shape}, shape={shape}")
-            t = th.tensor([i] * shape[0], device=device)
-            with th.no_grad():
-                current['step'] = i
-                out = self.ddim_sample(
-                    model,
-                    img,
-                    t,
-                    current=current,
-                    cache_dic=cache_dic,
-                    clip_denoised=clip_denoised,
-                    denoised_fn=denoised_fn,
-                    cond_fn=cond_fn,
-                    model_kwargs=model_kwargs,
-                    eta=eta,
-                )
-                self.x0_predictions.append(out["pred_xstart"].detach().cpu())
-                yield out
-                img = out["sample"]
+            if  indices[i_idx+1] == -1:
+                t = th.full((shape[0],), indices[-2], device=device, dtype=th.long)
+                with th.no_grad():
+                    current['step'] = i
+                    out = self.ddim_sample(
+                        model,
+                        img,
+                        t,
+                        current=current,
+                        cache_dic=cache_dic,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,
+                        eta=eta,
+                        t_next=None,  # 마지막은 next 없음
+                    )
+                    self.x0_predictions.append(out["pred_xstart"].detach().cpu())
+                    yield out
+                    img = out["sample"]
+            else:
+                t = th.tensor([i] * shape[0], device=device)
+                t_next = th.tensor([indices[i_idx + 1]] * shape[0], device=device)
+                with th.no_grad():
+                    current['step'] = i
+                    out = self.ddim_sample(
+                        model,
+                        img,
+                        t,
+                        current=current,
+                        cache_dic=cache_dic,
+                        clip_denoised=clip_denoised,
+                        denoised_fn=denoised_fn,
+                        cond_fn=cond_fn,
+                        model_kwargs=model_kwargs,
+                        eta=eta,
+                        t_next=t_next,
+                    )
+                    self.x0_predictions.append(out["pred_xstart"].detach().cpu())
+                    yield out
+                    img = out["sample"]
+
+
+                
         if cache_dic['test_FLOPs'] == True:
             print(cache_dic['flops'] * 1e-12, "TFLOPs")
 
