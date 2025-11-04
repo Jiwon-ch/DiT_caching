@@ -18,7 +18,7 @@ from models import DiT_models
 import argparse
 import os
 import numpy as np
-from taylor_utils import interpolate_features, get_interval
+from taylor_utils import *
 import math
 
 
@@ -135,15 +135,14 @@ def main(args):
                 for block in model.blocks:
                     block.collected_attn_features = model.collected_attn_features
                     block.collected_mlp_features = model.collected_mlp_features
-
+                
                 skip = interval if (end_t - start_t) >= interval else 1
-
                 torch.cuda.synchronize()
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
                 start_event.record()
 
-                z_coarse = diffusion.ddim_sample_loop(
+                z_coarse, z_next = diffusion.ddim_sample_loop(
                     model.forward_with_cfg,
                     z_coarse.shape,
                     noise=z_coarse,
@@ -152,10 +151,14 @@ def main(args):
                     progress=False,
                     device=device,
                     start_step=start_t,
-                    end_step=end_t, 
-                    skip_step=skip 
+                    end_step= start_t + 1 if (skip == 1 and end_t - start_t > 1) else end_t, 
+                    skip_step=skip,
+                    return_next_latent=True
                 )
 
+                if start_t == 0:
+                    z_fine = z_next.clone()
+                    
                 end_event.record()
                 torch.cuda.synchronize()
                 coarse_time = start_event.elapsed_time(end_event) * 0.001
@@ -165,6 +168,21 @@ def main(args):
                     "attn": torch.stack(model.collected_attn_features, dim=0),
                     "mlp":  torch.stack(model.collected_mlp_features, dim=0),
                 }
+
+                # print("="*60)
+                # print(f"[DEBUG] Coarse segment ({start_t} → {end_t}) | skip={skip}")
+                # print(f"  attn collected: {len(model.collected_attn_features)}")
+                # print(f"  mlp  collected: {len(model.collected_mlp_features)}")
+
+                # if len(model.collected_attn_features) > 0:
+                #     print(f"  attn[0] shape: {model.collected_attn_features[0].shape}")
+                # if len(model.collected_mlp_features) > 0:
+                #     print(f"  mlp[0] shape:  {model.collected_mlp_features[0].shape}")
+
+                # if isinstance(curr_features, dict):
+                #     print(f"  curr_features['attn'].shape = {curr_features['attn'].shape}")
+                #     print(f"  curr_features['mlp'].shape  = {curr_features['mlp'].shape}")
+                # print("="*60)
 
                 if end_t >= total_steps - 1:
                     prev_interval = interval_prev if interval_prev is not None else interval
@@ -176,13 +194,11 @@ def main(args):
                     attn_interp_ = interpolate_features(
                         [prev_features["attn"], curr_features["attn"]],
                         target_T=  prev_interval + 1,
-                        prevprev_tensor=None if prevprev_features is None else prevprev_features["attn"],
                         stage_ratio=stage_ratio
                     )
                     mlp_interp_ = interpolate_features(
                         [prev_features["mlp"], curr_features["mlp"]],
                         target_T= prev_interval + 1,
-                        prevprev_tensor=None if prevprev_features is None else prevprev_features["mlp"],
                         stage_ratio=stage_ratio
                     )
 
@@ -206,7 +222,7 @@ def main(args):
                         model_kwargs=model_kwargs,
                         progress=False,
                         device=device,
-                        start_step=start_t-prev_interval,
+                        start_step=start_t-prev_interval+1,
                         end_step=start_t
                     )
 
@@ -282,7 +298,7 @@ def main(args):
                         model_kwargs=model_kwargs,
                         progress=False,
                         device=device,
-                        start_step=start_t-prev_interval,
+                        start_step=start_t-prev_interval+1,
                         end_step=start_t
                     )
 
@@ -318,7 +334,7 @@ def main(args):
                     
                     print(f"[CORRECTION {start_t}->{end_t}] (new interval={interval})")
 
-                    z_coarse = diffusion.ddim_sample_loop(
+                    z_coarse, z_fine = diffusion.ddim_sample_loop(
                         model.forward_with_cfg,
                         z_coarse.shape,
                         noise=z_coarse,
@@ -328,7 +344,8 @@ def main(args):
                         device=device,
                         start_step=start_t,
                         end_step=end_t,
-                        skip_step=interval
+                        skip_step=interval,
+                        return_next_latent=True
                     )
                     
                     end_event.record()
@@ -337,11 +354,14 @@ def main(args):
                     correction_time_total += correction_time
 
 
-                    new_interval = get_interval(prev_features, curr_features, interval)      
+                    new_interval = get_interval_by_feature_curv(prevprev_features, prev_features, curr_features, interval)      
 
                     interval_prev = interval
-                    interval = new_interval  
-                    prev_features = curr_features 
+                    interval = new_interval
+
+                    prevprev_features = prev_features
+                    prev_features = curr_features
+                     
                 else:
                     prev_features = curr_features
                 

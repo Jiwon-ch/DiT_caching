@@ -90,6 +90,8 @@ def interpolate_features(tensor_list, target_T, prevprev_tensor=None, stage_rati
     return interp_tensor
 
 
+
+## 그냥 인접 step이랑 feature 변화량
 def get_interval(prev_features, curr_features, prev_interval, 
                  high_th=0.7, low_th=0.5, 
                  min_interval=3, max_interval=6):
@@ -100,7 +102,7 @@ def get_interval(prev_features, curr_features, prev_interval,
     if prev_features is None or curr_features is None:
         return prev_interval  # 첫 segment에서는 그대로 유지
     
-    # 변화량 계산 (attention + MLP)
+    #변화량 계산 (attention + MLP)
     diff_attn = torch.mean(torch.abs(curr_features["attn"] - prev_features["attn"])).item()
     diff_mlp  = torch.mean(torch.abs(curr_features["mlp"]  - prev_features["mlp"])).item()
     diff_mean = (diff_attn + diff_mlp) / 2
@@ -117,6 +119,54 @@ def get_interval(prev_features, curr_features, prev_interval,
         status = f"Moderate ({diff_mean:.4f}) = {new_interval}"
 
     print(f"[get_interval] {status}")
+    return new_interval
+
+
+## Curvature로 
+def get_interval_by_feature_curv(F_prevprev, F_prev, F_curr, prev_interval,
+                                 high_th=1, low_th=0.5,
+                                 min_interval=3, max_interval=6):
+    """
+    Adaptive coarse-step interval scheduling based on feature curvature.
+    
+    입력:
+        F_prevprev: feature at t-2Δ (tensor)
+        F_prev:     feature at t-Δ (tensor)
+        F_curr:     feature at t   (tensor)
+        prev_interval: 이전 coarse interval 길이
+    규칙:
+        curvature = mean(|(F_t - F_{t-Δ}) - (F_{t-Δ} - F_{t-2Δ})|)
+        curvature ↑  → 변화 급격 → interval 감소
+        curvature ↓  → 안정적 → interval 증가
+    """
+
+    # 초반부
+    if F_prevprev is None or F_prev is None or F_curr is None:
+        return prev_interval
+
+    # curvature 계산
+    curv_attn = torch.mean(torch.abs(
+        (F_curr["attn"] - F_prev["attn"]) - (F_prev["attn"] - F_prevprev["attn"])
+    )).item()
+
+    curv_mlp = torch.mean(torch.abs(
+        (F_curr["mlp"] - F_prev["mlp"]) - (F_prev["mlp"] - F_prevprev["mlp"])
+    )).item()
+
+    curvature = (curv_attn)
+
+    # adaptive
+    if curvature > high_th:
+        new_interval = max(prev_interval - 1, min_interval)
+        status = f"⚠️ High curvature ({curvature:.4f}) → Decrease interval → {new_interval}"
+    elif curvature < low_th:
+        new_interval = min(prev_interval + 1, max_interval)
+        status = f"✅ Stable ({curvature:.4f}) → Increase interval → {new_interval}"
+    else:
+        new_interval = prev_interval
+        status = f"~ Moderate ({curvature:.4f}) → Keep interval = {new_interval}"
+
+    print(f"[get_interval_by_feature_curv] {status}")
     return new_interval
 
 

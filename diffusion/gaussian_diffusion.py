@@ -549,6 +549,7 @@ class GaussianDiffusion:
         model_kwargs=None,
         eta=0.0,
         t_next=None,
+        return_next_latent=False,
     ):
         """
         Sample x_{t-1} from the model using DDIM.
@@ -608,7 +609,26 @@ class GaussianDiffusion:
             nonzero_mask = (t_next > 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         noise = th.randn_like(x)
         sample = mean_pred + nonzero_mask * sigma * noise
-        return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+        results = {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+        if return_next_latent:
+            # 기본 DDIM 식으로 다음 step latent 계산
+            alpha_bar_prev = _extract_into_tensor(self.alphas_cumprod_prev, t, x.shape)
+            sigma = (
+                eta
+                * th.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
+                * th.sqrt(1 - alpha_bar / alpha_bar_prev)
+            )
+            mean_pred = (
+                out["pred_xstart"] * th.sqrt(alpha_bar_prev)
+                + th.sqrt(1 - alpha_bar_prev - sigma**2) * eps
+            )
+            nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+            sample_next = mean_pred + sigma * noise
+            results["next_sample"] = sample_next
+
+        return results
 
     def ddim_reverse_sample(
         self,
@@ -664,6 +684,7 @@ class GaussianDiffusion:
         start_step=0,
         end_step=None,
         skip_step=1,
+        return_next_latent=False,
     ):
         """
         Generate samples from the model using DDIM.
@@ -688,11 +709,15 @@ class GaussianDiffusion:
             start_step=start_step,
             end_step=end_step,
             skip_step=skip_step,
+            return_next_latent=return_next_latent,
         ):
             final = sample
         if final is None:
             raise ValueError(f"[ddim_sample_loop] No steps executed! Check start_step={start_step}, end_step={end_step}, skip_step={skip_step}")
-        return final["sample"]
+        if return_next_latent and "next_sample" in final:
+            return final["sample"], final["next_sample"]
+        else:
+            return final["sample"]
 
     def ddim_sample_loop_progressive(
         self,
@@ -709,6 +734,7 @@ class GaussianDiffusion:
         start_step=0,
         end_step=None,
         skip_step=1,
+        return_next_latent=False,
     ):
         """
         Use DDIM to sample from the model and yield intermediate samples from
@@ -789,13 +815,12 @@ class GaussianDiffusion:
                         model_kwargs=model_kwargs,
                         eta=eta,
                         t_next=t_next,
+                        return_next_latent=return_next_latent,
                     )
                     self.x0_predictions.append(out["pred_xstart"].detach().cpu())
                     yield out
                     img = out["sample"]
 
-
-                
         if cache_dic['test_FLOPs'] == True:
             print(cache_dic['flops'] * 1e-12, "TFLOPs")
 
